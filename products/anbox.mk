@@ -38,16 +38,16 @@ PRODUCT_PACKAGES += \
 	fingerprintd
 
 PRODUCT_COPY_FILES += \
-	vendor/anbox/android/fstab.goldfish:root/fstab.goldfish \
-	vendor/anbox/android/init.goldfish.rc:root/init.goldfish.rc \
-	vendor/anbox/android/init.goldfish.sh:system/etc/init.goldfish.sh \
-	vendor/anbox/android/ueventd.goldfish.rc:root/ueventd.goldfish.rc \
-	vendor/anbox/android/media/media_profiles.xml:system/etc/media_profiles.xml \
-	vendor/anbox/android/media/media_codecs.xml:system/etc/media_codecs.xml \
-	vendor/anbox/android/media/media_codecs_google_audio.xml:system/etc/media_codecs_google_audio.xml \
-	vendor/anbox/android/media/media_codecs_google_telephony.xml:system/etc/media_codecs_google_telephony.xml \
-	vendor/anbox/android/media/media_codecs_google_tv.xml:system/etc/media_codecs_google_tv.xml \
-	vendor/anbox/android/media/media_codecs_google_video.xml:system/etc/media_codecs_google_video.xml \
+	anbox/android/fstab.goldfish:root/fstab.goldfish \
+	anbox/android/init.goldfish.rc:root/init.goldfish.rc \
+	anbox/android/init.goldfish.sh:system/etc/init.goldfish.sh \
+	anbox/android/ueventd.goldfish.rc:root/ueventd.goldfish.rc \
+	anbox/android/media/media_profiles.xml:system/etc/media_profiles.xml \
+	anbox/android/media/media_codecs.xml:system/etc/media_codecs.xml \
+	anbox/android/media/media_codecs_google_audio.xml:system/etc/media_codecs_google_audio.xml \
+	anbox/android/media/media_codecs_google_telephony.xml:system/etc/media_codecs_google_telephony.xml \
+	anbox/android/media/media_codecs_google_tv.xml:system/etc/media_codecs_google_tv.xml \
+	anbox/android/media/media_codecs_google_video.xml:system/etc/media_codecs_google_video.xml \
 	hardware/libhardware_legacy/audio/audio_policy.conf:system/etc/audio_policy.conf
 
 PRODUCT_CHARACTERISTICS := emulator
@@ -56,8 +56,8 @@ PRODUCT_CHARACTERISTICS := emulator
 PRODUCT_AAPT_CONFIG := normal
 
 PRODUCT_COPY_FILES += \
-	vendor/anbox/scripts/anbox-init.sh:root/anbox-init.sh \
-	vendor/anbox/products/anbox.xml:system/etc/permissions/anbox.xml
+	anbox/scripts/anbox-init.sh:root/anbox-init.sh \
+	anbox/products/anbox.xml:system/etc/permissions/anbox.xml
 
 PRODUCT_PACKAGES += \
 	anboxd \
@@ -89,11 +89,11 @@ PRODUCT_PROPERTY_OVERRIDES += \
 	debug.sf.nobootanimation=1
 
 DEVICE_PACKAGE_OVERLAYS += \
-	vendor/anbox/products/overlay
+	anbox/products/overlay
 
 $(call inherit-product, $(SRC_TARGET_DIR)/product/aosp_base.mk)
 # Extend heap size we use for dalvik/art runtime
 $(call inherit-product, frameworks/native/build/tablet-10in-xhdpi-2048-dalvik-heap.mk)
 
 PRODUCT_COPY_FILES += \
-	vendor/anbox/products/anbox.xml:system/etc/permissions/anbox.xml
+	anbox/products/anbox.xml:system/etc/permissions/anbox.xml
