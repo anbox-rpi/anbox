@@ -27,7 +27,7 @@
 #define DEBUG  1
 
 #if DEBUG
-#  include <cutils/log.h>
+#  include <log/log.h>
 #  define  DD(...)    ALOGI(__VA_ARGS__)
 #else
 #  define  DD(...)    ((void)0)
@@ -35,13 +35,20 @@
 
 #include <cutils/properties.h>
 #include <unistd.h>
-#include <hardware/qemud.h>
+#include "qemud.h"
 
 /* Name of the qemud service we want to connect to.
  */
 #define  QEMUD_SERVICE  "boot-properties"
 
 #define  MAX_TRIES      5
+
+#define QEMU_MISC_PIPE "QemuMiscPipe"
+
+int s_QemuMiscPipe = -1;
+void static notifyHostBootComplete();
+void static sendHeartBeat();
+void static sendMessage(const char* mesg);
 
 int  main(void)
 {
@@ -83,6 +90,7 @@ int  main(void)
         DD("receiving..");
         char* q;
         char  temp[BUFF_SIZE];
+        char  vendortemp[BUFF_SIZE];
         int   len = qemud_channel_recv(qemud_fd, temp, sizeof temp - 1);
 
         /* lone NUL-byte signals end of properties */
@@ -101,16 +109,82 @@ int  main(void)
         }
         *q++ = '\0';
 
-        if (property_set(temp, q) < 0) {
-            DD("could not set property '%s' to '%s'", temp, q);
+        char* final_prop_name = NULL;
+        if (strcmp(temp, "qemu.sf.lcd.density") == 0 ) {
+            final_prop_name = temp;
+        } else if (strcmp(temp, "qemu.hw.mainkeys") == 0 ) {
+            final_prop_name = temp;
+        } else if (strcmp(temp, "qemu.cmdline") == 0 ) {
+            final_prop_name = temp;
+        } else if (strcmp(temp, "dalvik.vm.heapsize") == 0 ) {
+            continue; /* cannot set it here */
+        } else if (strcmp(temp, "ro.opengles.version") == 0 ) {
+            continue; /* cannot set it here */
         } else {
+            snprintf(vendortemp, sizeof(vendortemp), "vendor.%s", temp);
+            final_prop_name = vendortemp;
+        }
+        if (property_set(temp, q) < 0) {
+            ALOGW("could not set property '%s' to '%s'", final_prop_name, q);
+        } else {
+            ALOGI("successfully set property '%s' to '%s'", final_prop_name, q);
             count += 1;
         }
     }
 
+    close(qemud_fd);
+
+    char temp[BUFF_SIZE];
+    sendHeartBeat();
+    while (s_QemuMiscPipe >= 0) {
+        usleep(5000000); /* 5 seconds */
+        sendHeartBeat();
+        property_get("vendor.qemu.dev.bootcomplete", temp, "");
+        int is_boot_completed = (strncmp(temp, "1", 1) == 0) ? 1 : 0;
+        if (is_boot_completed) {
+            ALOGI("tell the host boot completed");
+            notifyHostBootComplete();
+            break;
+        }
+    }
+
+    while (s_QemuMiscPipe >= 0) {
+        usleep(30*1000000); /* 30 seconds */
+        sendHeartBeat();
+    }
 
     /* finally, close the channel and exit */
-    close(qemud_fd);
+    if (s_QemuMiscPipe >= 0) {
+        close(s_QemuMiscPipe);
+        s_QemuMiscPipe = -1;
+    }
     DD("exiting (%d properties set).", count);
     return 0;
+}
+
+void sendHeartBeat() {
+    sendMessage("heartbeat");
+}
+
+void notifyHostBootComplete() {
+    sendMessage("bootcomplete");
+}
+
+void sendMessage(const char* mesg) {
+   if (s_QemuMiscPipe < 0) {
+        s_QemuMiscPipe = qemu_pipe_open(QEMU_MISC_PIPE);
+        if (s_QemuMiscPipe < 0) {
+            ALOGE("failed to open %s", QEMU_MISC_PIPE);
+            return;
+        }
+    }
+    char set[64];
+    snprintf(set, sizeof(set), "%s", mesg);
+    int pipe_command_length = strlen(set)+1; //including trailing '\0'
+    WriteFully(s_QemuMiscPipe, &pipe_command_length, sizeof(pipe_command_length));
+    WriteFully(s_QemuMiscPipe, set, pipe_command_length);
+    ReadFully(s_QemuMiscPipe, &pipe_command_length, sizeof(pipe_command_length));
+    if (pipe_command_length > (int)(sizeof(set)) || pipe_command_length <= 0)
+        return;
+    ReadFully(s_QemuMiscPipe, set, pipe_command_length);
 }

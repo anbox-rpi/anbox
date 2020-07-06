@@ -26,21 +26,24 @@
 #include <errno.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <sys/epoll.h>
 #include <math.h>
 #include <time.h>
 
 #define  LOG_TAG  "gps_qemu"
-#include <cutils/log.h>
+#include <log/log.h>
 #include <cutils/sockets.h>
+#include <cutils/properties.h>
 #include <hardware/gps.h>
-#include <hardware/qemud.h>
+#include "qemu_pipe.h"
 
-/* the name of the qemud-controlled socket */
-#define  QEMU_CHANNEL_NAME  "gps"
+/* the name of the qemu-controlled pipe */
+#define  QEMU_CHANNEL_NAME  "qemud:gps"
 
 #define  GPS_DEBUG  0
 
+#undef D
 #if GPS_DEBUG
 #  define  D(...)   ALOGD(__VA_ARGS__)
 #else
@@ -60,18 +63,33 @@ typedef struct {
     const char*  end;
 } Token;
 
-#define  MAX_NMEA_TOKENS  16
+#define  MAX_NMEA_TOKENS  64
 
 typedef struct {
     int     count;
     Token   tokens[ MAX_NMEA_TOKENS ];
 } NmeaTokenizer;
 
+/* this is the state of our connection to the qemu_gpsd daemon */
+typedef struct {
+    int                     init;
+    int                     fd;
+    GpsCallbacks            callbacks;
+    pthread_t               thread;
+    int                     control[2];
+    pthread_mutex_t         lock;
+    GpsMeasurementCallbacks*   measurement_callbacks; /* protected by lock:
+                                                         accessed by main and child threads */
+    bool                    gnss_enabled; /* set by ro.kernel.qemu.gps.gnss_enabled=1 */
+    bool                    fix_provided_by_gnss; /* set by ro.kernel.qemu.gps.fix_by_gnss=1 */
+} GpsState;
+
+static GpsState  _gps_state[1];
+
 static int
 nmea_tokenizer_init( NmeaTokenizer*  t, const char*  p, const char*  end )
 {
     int    count = 0;
-    char*  q;
 
     // the initial '$' is optional
     if (p < end && p[0] == '$')
@@ -126,40 +144,70 @@ nmea_tokenizer_get( NmeaTokenizer*  t, int  index )
 }
 
 
-static int
-str2int( const char*  p, const char*  end )
+static int64_t
+str2int64( const char*  p, const char*  end )
 {
-    int   result = 0;
+    int64_t   result = 0;
+
+#if GPS_DEBUG
+    char temp[1024];
+    snprintf(temp, sizeof(temp), "'%.*s'", end-p, p);
+#endif
+
+    bool is_negative = false;
+    if (end > p && *p == '-') {
+        is_negative = true;
+        ++p;
+    }
+
     int   len    = end - p;
 
     for ( ; len > 0; len--, p++ )
     {
         int  c;
 
-        if (p >= end)
+        if (p >= end) {
+            ALOGE("parse error at func %s line %d", __func__, __LINE__);
             goto Fail;
+        }
 
         c = *p - '0';
-        if ((unsigned)c >= 10)
+        if ((unsigned)c >= 10) {
+            ALOGE("parse error at func %s line %d on %c", __func__, __LINE__, c);
             goto Fail;
+        }
 
         result = result*10 + c;
     }
+    if (is_negative) {
+        result = - result;
+    }
+#if GPS_DEBUG
+    ALOGD("%s ==> %" PRId64, temp, result);
+#endif
     return  result;
 
 Fail:
     return -1;
 }
 
+static int
+str2int( const char*  p, const char*  end )
+{
+    /* danger: downward convert to 32bit */
+    return str2int64(p, end);
+}
+
 static double
 str2float( const char*  p, const char*  end )
 {
-    int   result = 0;
     int   len    = end - p;
-    char  temp[16];
+    char  temp[64];
 
-    if (len >= (int)sizeof(temp))
+    if (len >= (int)sizeof(temp)) {
+        ALOGE("%s %d input is too long: '%.*s'", __func__, __LINE__, end-p, p);
         return 0.;
+    }
 
     memcpy( temp, p, len );
     temp[len] = 0;
@@ -174,7 +222,7 @@ str2float( const char*  p, const char*  end )
 /*****************************************************************/
 /*****************************************************************/
 
-#define  NMEA_MAX_SIZE  83
+#define  NMEA_MAX_SIZE  1024
 
 typedef struct {
     int     pos;
@@ -182,39 +230,15 @@ typedef struct {
     int     utc_year;
     int     utc_mon;
     int     utc_day;
-    int     utc_diff;
     GpsLocation  fix;
     gps_location_callback  callback;
+    GnssData    gnss_data;
+    int         gnss_count;
+
     char    in[ NMEA_MAX_SIZE+1 ];
+    bool    gnss_enabled; /* passed in from _gps_state */
+    bool    fix_provided_by_gnss; /* passed in from _gps_state */
 } NmeaReader;
-
-
-static void
-nmea_reader_update_utc_diff( NmeaReader*  r )
-{
-    time_t         now = time(NULL);
-    struct tm      tm_local;
-    struct tm      tm_utc;
-    long           time_local, time_utc;
-
-    gmtime_r( &now, &tm_utc );
-    localtime_r( &now, &tm_local );
-
-    time_local = tm_local.tm_sec +
-                 60*(tm_local.tm_min +
-                 60*(tm_local.tm_hour +
-                 24*(tm_local.tm_yday +
-                 365*tm_local.tm_year)));
-
-    time_utc = tm_utc.tm_sec +
-               60*(tm_utc.tm_min +
-               60*(tm_utc.tm_hour +
-               24*(tm_utc.tm_yday +
-               365*tm_utc.tm_year)));
-
-    r->utc_diff = time_utc - time_local;
-}
-
 
 static void
 nmea_reader_init( NmeaReader*  r )
@@ -229,19 +253,10 @@ nmea_reader_init( NmeaReader*  r )
     r->callback = NULL;
     r->fix.size = sizeof(r->fix);
 
-    nmea_reader_update_utc_diff( r );
-}
+    GpsState*  s = _gps_state;
+    r->gnss_enabled = s->gnss_enabled;
+    r->fix_provided_by_gnss = s->fix_provided_by_gnss;
 
-
-static void
-nmea_reader_set_callback( NmeaReader*  r, gps_location_callback  cb )
-{
-    r->callback = cb;
-    if (cb != NULL && r->fix.flags != 0) {
-        D("%s: sending latest fix to new callback", __FUNCTION__);
-        r->callback( &r->fix );
-        r->fix.flags = 0;
-    }
 }
 
 
@@ -277,7 +292,7 @@ nmea_reader_update_time( NmeaReader*  r, Token  tok )
     tm.tm_mday  = r->utc_day;
     tm.tm_isdst = -1;
 
-    fix_time = mktime( &tm ) + r->utc_diff;
+    fix_time = timegm( &tm );
     r->fix.timestamp = (long long)fix_time * 1000;
     return 0;
 }
@@ -330,6 +345,8 @@ nmea_reader_update_latlong( NmeaReader*  r,
     double   lat, lon;
     Token    tok;
 
+    r->fix.flags &= ~GPS_LOCATION_HAS_LAT_LONG;
+
     tok = latitude;
     if (tok.p + 6 > tok.end) {
         D("latitude is too short: '%.*s'", tok.end-tok.p, tok.p);
@@ -356,12 +373,13 @@ nmea_reader_update_latlong( NmeaReader*  r,
 
 
 static int
-nmea_reader_update_altitude( NmeaReader*  r,
-                             Token        altitude,
-                             Token        units )
+nmea_reader_update_altitude( NmeaReader* r,
+                             Token altitude,
+                             Token __unused units )
 {
-    double  alt;
     Token   tok = altitude;
+
+    r->fix.flags &= ~GPS_LOCATION_HAS_ALTITUDE;
 
     if (tok.p >= tok.end)
         return -1;
@@ -376,8 +394,9 @@ static int
 nmea_reader_update_bearing( NmeaReader*  r,
                             Token        bearing )
 {
-    double  alt;
     Token   tok = bearing;
+
+    r->fix.flags &= ~GPS_LOCATION_HAS_BEARING;
 
     if (tok.p >= tok.end)
         return -1;
@@ -392,8 +411,9 @@ static int
 nmea_reader_update_speed( NmeaReader*  r,
                           Token        speed )
 {
-    double  alt;
     Token   tok = speed;
+
+    r->fix.flags &= ~GPS_LOCATION_HAS_SPEED;
 
     if (tok.p >= tok.end)
         return -1;
@@ -413,6 +433,43 @@ nmea_reader_update_accuracy( NmeaReader*  r )
     return 0;
 }
 
+static int64_t get_int64(Token tok) {
+    return str2int64(tok.p, tok.end);
+}
+
+static int get_int(Token tok) {
+    return str2int(tok.p, tok.end);
+}
+
+static double get_double(Token tok) {
+    return str2float(tok.p, tok.end);
+}
+
+static bool has_all_required_flags(GpsLocationFlags flags) {
+    return ( flags & GPS_LOCATION_HAS_LAT_LONG
+            && flags & GPS_LOCATION_HAS_ALTITUDE
+           );
+}
+
+static bool is_ready_to_send(NmeaReader* r) {
+    if (has_all_required_flags(r->fix.flags)) {
+        if (r->gnss_enabled && r->fix_provided_by_gnss) {
+            return (r->gnss_count > 2); /* required by CTS */
+        }
+        return true;
+    }
+    return false;
+}
+
+static void
+nmea_reader_set_callback( NmeaReader*  r, gps_location_callback  cb )
+{
+    r->callback = cb;
+    if (cb != NULL && is_ready_to_send(r)) {
+        D("%s: sending latest fix to new callback", __FUNCTION__);
+        r->callback( &r->fix );
+    }
+}
 
 static void
 nmea_reader_parse( NmeaReader*  r )
@@ -466,6 +523,30 @@ nmea_reader_parse( NmeaReader*  r )
                                       tok_longitudeHemi.p[0]);
         nmea_reader_update_altitude(r, tok_altitude, tok_altitudeUnits);
 
+    } else if ( !memcmp(tok.p, "GNSSv1", 6) ) {
+        r->gnss_data.clock.time_ns                         = get_int64(nmea_tokenizer_get(tzer,1));
+        r->gnss_data.clock.full_bias_ns                    = get_int64(nmea_tokenizer_get(tzer,2));
+        r->gnss_data.clock.bias_ns                         = get_double(nmea_tokenizer_get(tzer,3));
+        r->gnss_data.clock.bias_uncertainty_ns             = get_double(nmea_tokenizer_get(tzer,4));
+        r->gnss_data.clock.drift_nsps                      = get_double(nmea_tokenizer_get(tzer,5));
+        r->gnss_data.clock.drift_uncertainty_nsps          = get_double(nmea_tokenizer_get(tzer,6));
+        r->gnss_data.clock.hw_clock_discontinuity_count    = get_int(nmea_tokenizer_get(tzer,7));
+        r->gnss_data.clock.flags                           = get_int(nmea_tokenizer_get(tzer,8));
+
+        r->gnss_data.measurement_count  = get_int(nmea_tokenizer_get(tzer,9));
+
+        for (int i = 0; i < r->gnss_data.measurement_count; ++i) {
+            r->gnss_data.measurements[i].svid                               = get_int(nmea_tokenizer_get(tzer,10 + i*9 + 0));
+            r->gnss_data.measurements[i].constellation                      = get_int(nmea_tokenizer_get(tzer,10 + i*9 + 1));
+            r->gnss_data.measurements[i].state                              = get_int(nmea_tokenizer_get(tzer,10 + i*9 + 2));
+            r->gnss_data.measurements[i].received_sv_time_in_ns             = get_int64(nmea_tokenizer_get(tzer,10 + i*9 + 3));
+            r->gnss_data.measurements[i].received_sv_time_uncertainty_in_ns = get_int64(nmea_tokenizer_get(tzer,10 + i*9 + 4));
+            r->gnss_data.measurements[i].c_n0_dbhz                          = get_double(nmea_tokenizer_get(tzer,10 + i*9 + 5));
+            r->gnss_data.measurements[i].pseudorange_rate_mps               = get_double(nmea_tokenizer_get(tzer,10 + i*9 + 6));
+            r->gnss_data.measurements[i].pseudorange_rate_uncertainty_mps   = get_double(nmea_tokenizer_get(tzer,10 + i*9 + 7));
+            r->gnss_data.measurements[i].carrier_frequency_hz               = get_double(nmea_tokenizer_get(tzer,10 + i*9 + 8));
+            r->gnss_data.measurements[i].flags                              = GNSS_MEASUREMENT_HAS_CARRIER_FREQUENCY;
+        }
     } else if ( !memcmp(tok.p, "GSA", 3) ) {
         // do something ?
     } else if ( !memcmp(tok.p, "RMC", 3) ) {
@@ -500,7 +581,7 @@ nmea_reader_parse( NmeaReader*  r )
     // Always update accuracy
     nmea_reader_update_accuracy( r );
 
-    if (r->fix.flags != 0) {
+    if (is_ready_to_send(r)) {
 #if GPS_DEBUG
         char   temp[256];
         char*  p   = temp;
@@ -523,17 +604,35 @@ nmea_reader_parse( NmeaReader*  r )
         if (r->fix.flags & GPS_LOCATION_HAS_ACCURACY) {
             p += snprintf(p,end-p, " accuracy=%g", r->fix.accuracy);
         }
-        gmtime_r( (time_t*) &r->fix.timestamp, &utc );
+        //The unit of r->fix.timestamp is millisecond.
+        time_t timestamp = r->fix.timestamp / 1000;
+        gmtime_r( (time_t*) &timestamp, &utc );
         p += snprintf(p, end-p, " time=%s", asctime( &utc ) );
-        D(temp);
 #endif
         if (r->callback) {
+            D("%s", temp);
             r->callback( &r->fix );
+            /* we have sent a complete fix, now prepare for next complete fix */
             r->fix.flags = 0;
         }
         else {
             D("no callback, keeping data until needed !");
         }
+    }
+
+    if (r->gnss_data.measurement_count > 0) {
+        /* this runs in child thread */
+        GpsState*  s = _gps_state;
+        pthread_mutex_lock(&s->lock);
+        if (s->measurement_callbacks && s->measurement_callbacks->gnss_measurement_callback) {
+            D("sending gnss measurement data");
+            s->measurement_callbacks->gnss_measurement_callback(&r->gnss_data);
+            r->gnss_data.measurement_count = 0;
+            r->gnss_count ++;
+        } else {
+            D("no gnss measurement_callbacks, keeping data until needed !");
+        }
+        pthread_mutex_unlock(&s->lock);
     }
 }
 
@@ -578,17 +677,6 @@ enum {
 };
 
 
-/* this is the state of our connection to the qemu_gpsd daemon */
-typedef struct {
-    int                     init;
-    int                     fd;
-    GpsCallbacks            callbacks;
-    pthread_t               thread;
-    int                     control[2];
-} GpsState;
-
-static GpsState  _gps_state[1];
-
 
 static void
 gps_state_done( GpsState*  s )
@@ -598,6 +686,8 @@ gps_state_done( GpsState*  s )
     void*  dummy;
     write( s->control[0], &cmd, 1 );
     pthread_join(s->thread, &dummy);
+
+    pthread_mutex_destroy(&s->lock);
 
     // close the control socket pair
     close( s->control[0] ); s->control[0] = -1;
@@ -658,15 +748,15 @@ epoll_register( int  epoll_fd, int  fd )
 }
 
 
-static int
-epoll_deregister( int  epoll_fd, int  fd )
-{
-    int  ret;
-    do {
-        ret = epoll_ctl( epoll_fd, EPOLL_CTL_DEL, fd, NULL );
-    } while (ret < 0 && errno == EINTR);
-    return ret;
-}
+// static int
+// epoll_deregister( int  epoll_fd, int  fd )
+// {
+//     int  ret;
+//     do {
+//         ret = epoll_ctl( epoll_fd, EPOLL_CTL_DEL, fd, NULL );
+//     } while (ret < 0 && errno == EINTR);
+//     return ret;
+// }
 
 /* this is the main thread, it waits for commands from gps_state_start/stop and,
  * when started, messages from the QEMU GPS daemon. these are simple NMEA sentences
@@ -681,6 +771,17 @@ gps_state_thread( void*  arg )
     int         started    = 0;
     int         gps_fd     = state->fd;
     int         control_fd = state->control[1];
+    GpsStatus gps_status;
+    gps_status.size = sizeof(gps_status);
+    GpsSvStatus  gps_sv_status;
+    memset(&gps_sv_status, 0, sizeof(gps_sv_status));
+    gps_sv_status.size = sizeof(gps_sv_status);
+    gps_sv_status.num_svs = 1;
+    gps_sv_status.sv_list[0].size = sizeof(gps_sv_status.sv_list[0]);
+    gps_sv_status.sv_list[0].prn = 17;
+    gps_sv_status.sv_list[0].snr = 60.0;
+    gps_sv_status.sv_list[0].elevation = 30.0;
+    gps_sv_status.sv_list[0].azimuth = 30.0;
 
     nmea_reader_init( reader );
 
@@ -695,7 +796,15 @@ gps_state_thread( void*  arg )
         struct epoll_event   events[2];
         int                  ne, nevents;
 
-        nevents = epoll_wait( epoll_fd, events, 2, -1 );
+        int timeout = -1;
+        if (gps_status.status == GPS_STATUS_SESSION_BEGIN) {
+            timeout = 10 * 1000; // 10 seconds
+        }
+        nevents = epoll_wait( epoll_fd, events, 2, timeout );
+        if (state->callbacks.sv_status_cb) {
+            state->callbacks.sv_status_cb(&gps_sv_status);
+        }
+        // update satilite info
         if (nevents < 0) {
             if (errno != EINTR)
                 ALOGE("epoll_wait() unexpected error: %s", strerror(errno));
@@ -712,7 +821,7 @@ gps_state_thread( void*  arg )
 
                 if (fd == control_fd)
                 {
-                    char  cmd = 255;
+                    char  cmd = 0xFF;
                     int   ret;
                     D("gps control fd event");
                     do {
@@ -727,7 +836,12 @@ gps_state_thread( void*  arg )
                         if (!started) {
                             D("gps thread starting  location_cb=%p", state->callbacks.location_cb);
                             started = 1;
+                            reader->gnss_count = 0;
                             nmea_reader_set_callback( reader, state->callbacks.location_cb );
+                            gps_status.status = GPS_STATUS_SESSION_BEGIN;
+                            if (state->callbacks.status_cb) {
+                                state->callbacks.status_cb(&gps_status);
+                            }
                         }
                     }
                     else if (cmd == CMD_STOP) {
@@ -735,6 +849,10 @@ gps_state_thread( void*  arg )
                             D("gps thread stopping");
                             started = 0;
                             nmea_reader_set_callback( reader, NULL );
+                            gps_status.status = GPS_STATUS_SESSION_END;
+                            if (state->callbacks.status_cb) {
+                                state->callbacks.status_cb(&gps_status);
+                            }
                         }
                     }
                 }
@@ -768,6 +886,18 @@ gps_state_thread( void*  arg )
     }
 }
 
+#define  BUFF_SIZE   (PROPERTY_KEY_MAX + PROPERTY_VALUE_MAX + 2)
+static bool is_gnss_measurement_enabled() {
+    char temp[BUFF_SIZE];
+    property_get("ro.kernel.qemu.gps.gnss_enabled", temp, "");
+    return (strncmp(temp, "1", 1) == 0);
+}
+
+static bool is_fix_provided_by_gnss_measurement() {
+    char temp[BUFF_SIZE];
+    property_get("ro.kernel.qemu.gps.fix_by_gnss", temp, "");
+    return (strncmp(temp, "1", 1) == 0);
+}
 
 static void
 gps_state_init( GpsState*  state, GpsCallbacks* callbacks )
@@ -777,19 +907,25 @@ gps_state_init( GpsState*  state, GpsCallbacks* callbacks )
     state->control[1] = -1;
     state->fd         = -1;
 
-    state->fd = qemud_channel_open(QEMU_CHANNEL_NAME);
+    state->fd = qemu_pipe_open(QEMU_CHANNEL_NAME);
 
     if (state->fd < 0) {
         D("no gps emulation detected");
         return;
     }
 
-    D("gps emulation will read from '%s' qemud channel", QEMU_CHANNEL_NAME );
+    D("gps emulation will read from '%s' qemu pipe", QEMU_CHANNEL_NAME );
 
     if ( socketpair( AF_LOCAL, SOCK_STREAM, 0, state->control ) < 0 ) {
         ALOGE("could not create thread control socket pair: %s", strerror(errno));
         goto Fail;
     }
+
+    state->gnss_enabled = is_gnss_measurement_enabled();
+    D("gnss_enabled:%s", state->gnss_enabled ? "yes":"no");
+    state->fix_provided_by_gnss = is_fix_provided_by_gnss_measurement();
+
+    pthread_mutex_init (&state->lock, (const pthread_mutexattr_t *) NULL);
 
     state->thread = callbacks->create_thread_cb( "gps_state_thread", gps_state_thread, state );
 
@@ -799,6 +935,22 @@ gps_state_init( GpsState*  state, GpsCallbacks* callbacks )
     }
 
     state->callbacks = *callbacks;
+
+    // Explicitly initialize capabilities
+    state->callbacks.set_capabilities_cb(0);
+
+
+
+
+    // Setup system info, we are pre 2016 hardware.
+    GnssSystemInfo sysinfo;
+    sysinfo.size = sizeof(GnssSystemInfo);
+    sysinfo.year_of_hw = 2015;
+    state->callbacks.set_system_info_cb(&sysinfo);
+    if (state->gnss_enabled) {
+        D("enabling GPS_CAPABILITY_MEASUREMENTS");
+        state->callbacks.set_capabilities_cb(GPS_CAPABILITY_MEASUREMENTS);
+    }
 
     D("gps state initialized");
     return;
@@ -874,32 +1026,73 @@ qemu_gps_stop()
 
 
 static int
-qemu_gps_inject_time(GpsUtcTime time, int64_t timeReference, int uncertainty)
+qemu_gps_inject_time(GpsUtcTime __unused time,
+                     int64_t __unused timeReference,
+                     int __unused uncertainty)
 {
     return 0;
 }
 
 static int
-qemu_gps_inject_location(double latitude, double longitude, float accuracy)
+qemu_gps_inject_location(double __unused latitude,
+                         double __unused longitude,
+                         float __unused accuracy)
 {
     return 0;
 }
 
 static void
-qemu_gps_delete_aiding_data(GpsAidingData flags)
+qemu_gps_delete_aiding_data(GpsAidingData __unused flags)
 {
 }
 
-static int qemu_gps_set_position_mode(GpsPositionMode mode, int fix_frequency)
+static int qemu_gps_set_position_mode(GpsPositionMode __unused mode,
+                                      GpsPositionRecurrence __unused recurrence,
+                                      uint32_t __unused min_interval,
+                                      uint32_t __unused preferred_accuracy,
+                                      uint32_t __unused preferred_time)
 {
     // FIXME - support fix_frequency
     return 0;
 }
 
+static int qemu_gps_measurement_init(GpsMeasurementCallbacks* callbacks) {
+    /* this runs in main thread */
+    D("calling %s with input %p", __func__, callbacks);
+    GpsState*  s = _gps_state;
+    pthread_mutex_lock(&s->lock);
+    s->measurement_callbacks = callbacks;
+    pthread_mutex_unlock(&s->lock);
+
+    return 0;
+}
+
+static void qemu_gps_measurement_close() {
+    /* this runs in main thread */
+    D("calling %s", __func__);
+    GpsState*  s = _gps_state;
+    pthread_mutex_lock(&s->lock);
+    s->measurement_callbacks = NULL;
+    pthread_mutex_unlock(&s->lock);
+}
+
+static const GpsMeasurementInterface qemuGpsMeasurementInterface  = {
+    sizeof(GpsMeasurementInterface),
+    qemu_gps_measurement_init,
+    qemu_gps_measurement_close,
+};
+
 static const void*
 qemu_gps_get_extension(const char* name)
 {
-    // no extensions supported
+    if(name && strcmp(name, GPS_MEASUREMENT_INTERFACE) == 0) {
+        /* when this is called, _gps_state is not initialized yet */
+        bool gnss_enabled = is_gnss_measurement_enabled();
+        if (gnss_enabled) {
+            D("calling %s with GPS_MEASUREMENT_INTERFACE enabled", __func__);
+            return &qemuGpsMeasurementInterface;
+        }
+    }
     return NULL;
 }
 
@@ -916,13 +1109,14 @@ static const GpsInterface  qemuGpsInterface = {
     qemu_gps_get_extension,
 };
 
-const GpsInterface* gps__get_gps_interface(struct gps_device_t* dev)
+const GpsInterface* gps__get_gps_interface(struct gps_device_t* __unused dev)
 {
     return &qemuGpsInterface;
 }
 
-static int open_gps(const struct hw_module_t* module, char const* name,
-        struct hw_device_t** device)
+static int open_gps(const struct hw_module_t* module,
+                    char const* __unused name,
+                    struct hw_device_t** device)
 {
     struct gps_device_t *dev = malloc(sizeof(struct gps_device_t));
     memset(dev, 0, sizeof(*dev));

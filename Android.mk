@@ -102,7 +102,6 @@ include $(TMP_PATH)/android/appmgr/Android.mk
 include $(TMP_PATH)/android/fingerprint/Android.mk
 include $(TMP_PATH)/android/power/Android.mk
 include $(TMP_PATH)/android/qemu-props/Android.mk
-include $(TMP_PATH)/android/qemud/Android.mk
 include $(TMP_PATH)/android/sensors/Android.mk
 include $(TMP_PATH)/android/opengl/Android.mk
 include $(TMP_PATH)/android/gps/Android.mk

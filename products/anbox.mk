@@ -26,7 +26,6 @@ PRODUCT_PACKAGES += \
 	libGLESv2_emulation \
 	libGLESv1_enc \
 	qemu-props \
-	qemud \
 	camera.goldfish \
 	camera.goldfish.jpeg \
 	lights.goldfish \
