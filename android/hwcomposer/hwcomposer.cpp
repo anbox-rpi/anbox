@@ -73,7 +73,7 @@ struct HwcContext {
 
 static void dump_layer(hwc_layer_1_t const* l) {
     ALOGD("\tname='%s', type=%d, flags=%08x, handle=%p, tr=%02x, blend=%04x, {%d,%d,%d,%d}, {%d,%d,%d,%d}",
-            l->name, l->compositionType, l->flags, l->handle, l->transform, l->blending,
+            "PLACEHOLDER", l->compositionType, l->flags, l->handle, l->transform, l->blending,
             l->sourceCrop.left,
             l->sourceCrop.top,
             l->sourceCrop.right,
@@ -195,7 +195,7 @@ static int hwc_set(hwc_composer_device_1_t* dev, size_t numDisplays,
         }
 
         rcEnc->rcPostLayer(rcEnc,
-                           layer->name,
+                           "PLACEHOLDER",
                            cb->hostHandle,
                            layer->planeAlpha / 255,
                            layer->sourceCrop.left,
