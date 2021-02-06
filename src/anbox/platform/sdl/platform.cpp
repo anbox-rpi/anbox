@@ -32,9 +32,7 @@
 #include <sys/types.h>
 #pragma GCC diagnostic pop
 
-namespace anbox {
-namespace platform {
-namespace sdl {
+namespace anbox::platform::sdl {
 Platform::Platform(
     const std::shared_ptr<input::Manager> &input_manager,
     const Configuration &config)
@@ -52,6 +50,12 @@ Platform::Platform(
   // Don't disable compositing
   // Available since SDL 2.0.8
   SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
+#endif
+
+#ifdef SDL_HINT_TOUCH_MOUSE_EVENTS
+  // Don't emulate mouse events from touch, we're handling touch ourselves.
+  // Available since SDL 2.0.10
+  SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
 #endif
 
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS) < 0) {
@@ -508,6 +512,4 @@ std::shared_ptr<audio::Source> Platform::create_audio_source() {
 bool Platform::supports_multi_window() const {
   return true;
 }
-} // namespace sdl
-} // namespace platform
-} // namespace anbox
+}

@@ -27,14 +27,15 @@
 #include "anbox/graphics/gl_renderer_server.h"
 #include "anbox/graphics/rect.h"
 
-namespace anbox {
-namespace bridge {
-class AndroidApiStub;
-} // namespace bridge
-namespace container {
-class Client;
-}  // namespace container
-namespace cmds {
+namespace anbox::bridge {
+  class AndroidApiStub;
+}
+
+namespace anbox::container {
+  class Client;
+}
+
+namespace anbox::cmds {
 class SessionManager : public cli::CommandWithFlagsAndAction {
  public:
   SessionManager();
@@ -44,6 +45,7 @@ class SessionManager : public cli::CommandWithFlagsAndAction {
 
   std::shared_ptr<container::Client> container_;
   std::string desktop_file_hint_;
+  std::string disabled_sensors_;
   bool single_window_ = false;
   graphics::Rect window_size_;
   bool standalone_ = false;
@@ -53,7 +55,5 @@ class SessionManager : public cli::CommandWithFlagsAndAction {
   bool no_touch_emulation_ = false;
   bool server_side_decoration_ = false;
 };
-}  // namespace cmds
-}  // namespace anbox
-
+}
 #endif
